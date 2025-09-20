@@ -167,7 +167,18 @@ type Message struct {
 ```
 
 # Bus Slog
-
+By default bus will not optout anything
+```
+// bus/slog.go:
+var Slog *slog.Logger = slog.New(&NilHandler{})
+```
+You can override it
 ```go
+import "github.com/frifox/bus"
 
+func init() {
+    bus.Slog = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+        Level: slog.LevelDebug,
+    }))
+}
 ```
