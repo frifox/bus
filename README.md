@@ -168,7 +168,7 @@ type Message struct {
 
 # Bus Slog
 By default bus will not optout anything
-```
+```go
 // bus/slog.go:
 var Slog *slog.Logger = slog.New(&NilHandler{})
 ```
