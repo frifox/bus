@@ -2,10 +2,8 @@ package bus
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,74 +13,75 @@ var ErrPublishing = errors.New("publish failed")
 var ErrReplyTimeout = errors.New("bus reply timeout")
 var ErrRequestCancelled = errors.New("request cancelled")
 
-type PublishOpts struct {
-	ToQueue    string
-	ToFunc     string
-	BusTimeout time.Duration
-	BusTTL     time.Duration
+//type PublishOpts struct {
+//	ToQueue    string
+//	ToFunc     string
+//	BusTimeout time.Duration
+//	BusTTL     time.Duration
+//}
+
+func (b *Bus) publishBacklog() {
+	for {
+		select {
+		case job, open := <-b.outBacklog.Jobs:
+			if !open {
+				break
+			}
+
+			err := b.Publish(job.Request)
+			if err != nil {
+				Slog.Error("failed publishing backlog", "err", err)
+				return
+			}
+		case <-b.connCtx.Done():
+			return
+		}
+	}
 }
 
-// PublishAndReturn extends PublishAndClose by preparing bus.Message and returning bus.Message when it comes in
-func (b *Bus) PublishAndReturn(request any, toQueue string, toFunc string, msgTimeout time.Duration, msgTTL time.Duration, requestCtxs ...context.Context) (*Message, error) {
-	if toQueue == "" {
-		return nil, errors.New("toQueue is empty")
-	}
-	if toFunc == "" {
-		return nil, errors.New("toFunc is empty")
+const MsgTypeRequest = "Request"
+const MsgTypeResponse = "Response"
+const MsgTypeCtxCancel = "CtxCancel"
+
+// Publish pushes msg to bus. Useful if RPCs are one-way, or you want to handle replies yourself
+func (b *Bus) Publish(msg *Message) error {
+	// just in case
+	if msg.BusMsgType == "" {
+		msg.BusMsgType = MsgTypeRequest
 	}
 
-	// defaults
-	if msgTimeout == 0 {
-		Slog.Warn("msg with MsgTimeout=0. Falling back to 10s")
-		msgTimeout = time.Second * 10
-	}
-	if msgTTL == 0 {
-		Slog.Warn("msg with MsgTTL=0. Falling back to 10m")
-		msgTTL = time.Minute * 10
+	// if conn is down, publish after conn is restored
+	if b.connCtx == nil || b.connCtx.Err() != nil {
+		b.outBacklog.Add(msg.MsgID, msg)
+		return nil
 	}
 
-	// prepare bus msg
-	busMsg := Message{
-		BusMsgType:  MsgTypeRequest,
-		ToQueue:     toQueue,
-		ToFunc:      toFunc,
-		MsgDeadline: time.Now().Add(msgTimeout),
-		MsgTTL:      msgTTL,
-	}
-	switch request := request.(type) {
-	case nil:
-		// empty body
-	case []byte:
-		busMsg.Body = request
-	case string:
-		busMsg.Body = []byte(request)
-	default:
-		data, err := json.Marshal(request)
-		if err != nil {
-			return nil, fmt.Errorf("marshal(requeset): %w", err)
-		}
-		busMsg.Body = data
+	// ack will be nil (channel default is confirming=false)
+	_, err := b.outChan.publishWithDeferredConfirm(publishOpts{
+		Exchange:   "",          // single pub to sincle queue = can use default exchange
+		RoutingKey: msg.ToQueue, // queue name
+		Mandatory:  false,       // don't check if queue exists
+		Immediate:  false,       // don't need consumer to be running
+		Publishing: msg.ToPublishing(),
+	})
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrPublishing, err)
 	}
 
-	// send it and wait
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	var ret any
-	b.PublishAndClose(&busMsg, func(pubReturn any) {
-		ret = pubReturn
-		wg.Done()
-	}, requestCtxs...)
-	wg.Wait()
+	Slog.Info("published to bus", "MsgID", msg.MsgID, "queue", msg.ToQueue, "func", msg.ToFunc, "body", msg.Body)
 
-	// what was returned?
-	switch ret := ret.(type) {
-	case error: // publishing err
-		return nil, ret
-	case *Message: // worker reply
-		return ret, nil
-	default:
-		return nil, errors.New("unexpected PublishAndClose return")
-	}
+	return nil
+}
+
+func (b *Bus) CancelMsg(msg Message, callbackQueue string) error {
+	Slog.Debug("CancelMsg()", "msgID", msg.MsgID)
+
+	return b.Publish(&Message{
+		BusMsgType: MsgTypeCtxCancel,
+		MsgID:      msg.MsgID,
+		ToQueue:    callbackQueue,
+		MsgTTL:     b.MsgTTL,
+	})
 }
 
 // PublishAndClose extends Publish by catching replies + handing bus timeouts / request cancels
@@ -162,68 +161,4 @@ func (b *Bus) PublishAndClose(msg *Message, userClosure func(any), requestCtxs .
 	case <-replyCtx.Done():
 		// success
 	}
-}
-
-func (b *Bus) publishBacklog() {
-	for {
-		select {
-		case job, open := <-b.outBacklog.Jobs:
-			if !open {
-				break
-			}
-
-			err := b.Publish(job.Request)
-			if err != nil {
-				Slog.Error("failed publishing backlog", "err", err)
-				return
-			}
-		case <-b.connCtx.Done():
-			return
-		}
-	}
-}
-
-func (b *Bus) CancelMsg(msg Message, callbackQueue string) error {
-	Slog.Debug("CancelMsg()", "msgID", msg.MsgID)
-
-	return b.Publish(&Message{
-		BusMsgType: MsgTypeCtxCancel,
-		MsgID:      msg.MsgID,
-		ToQueue:    callbackQueue,
-		MsgTTL:     b.MsgTTL,
-	})
-}
-
-const MsgTypeRequest = "Request"
-const MsgTypeResponse = "Response"
-const MsgTypeCtxCancel = "CtxCancel"
-
-// Publish pushes msg to bus. Useful if RPCs are one-way, or you want to handle replies yourself
-func (b *Bus) Publish(msg *Message) error {
-	// just in case
-	if msg.BusMsgType == "" {
-		msg.BusMsgType = MsgTypeRequest
-	}
-
-	// if conn is down, publish after conn is restored
-	if b.connCtx == nil || b.connCtx.Err() != nil {
-		b.outBacklog.Add(msg.MsgID, msg)
-		return nil
-	}
-
-	// ack will be nil (channel default is confirming=false)
-	_, err := b.outChan.publishWithDeferredConfirm(publishOpts{
-		Exchange:   "",          // single pub to sincle queue = can use default exchange
-		RoutingKey: msg.ToQueue, // queue name
-		Mandatory:  false,       // don't check if queue exists
-		Immediate:  false,       // don't need consumer to be running
-		Publishing: msg.ToPublishing(),
-	})
-	if err != nil {
-		return fmt.Errorf("%w: %w", ErrPublishing, err)
-	}
-
-	Slog.Info("published to bus", "MsgID", msg.MsgID, "queue", msg.ToQueue, "func", msg.ToFunc, "body", msg.Body)
-
-	return nil
 }

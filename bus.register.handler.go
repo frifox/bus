@@ -1,6 +1,7 @@
 package bus
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"reflect"
@@ -13,7 +14,7 @@ type HandlerOpts struct {
 	Prefetch int
 }
 
-const NoPrefetchSuffix = ":noprefetch"
+const NoPrefetchSuffix = ":noprefetch" // special queue for bypassing Prefetch, ie for interrupts
 
 // RegisterHandler registers 1 handler (with many funcs) to handle msgs from 1 queue
 func (b *Bus) RegisterHandler(opts HandlerOpts) error {
@@ -26,6 +27,10 @@ func (b *Bus) RegisterHandler(opts HandlerOpts) error {
 	if hValue.IsNil() {
 		return fmt.Errorf("handler ptr is nil")
 	}
+	if hValue.Elem().Kind() == reflect.Ptr {
+		return errors.New("handler is **ptr, pass it as *ptr instead")
+	}
+
 	hType := reflect.TypeOf(opts.Handler)
 
 	// register supported handler

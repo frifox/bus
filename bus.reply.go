@@ -132,6 +132,8 @@ func (b *Bus) sendHandlerReturnToBus(msg *Message, ret *reflect.Value) {
 					break
 				}
 				reply.Body = bodyBytes
+			//case reflect.Interface:
+			//	Slog.Error("unexpected ret type", "type", ret.Kind().String(), "val", body.Interface())
 			default:
 				Slog.Error("unexpected ret type", "type", ret.Kind().String())
 			}

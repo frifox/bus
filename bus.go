@@ -101,7 +101,7 @@ func (b *Bus) Run() {
 		// connect
 		err := b.Connect()
 		if err != nil {
-			Slog.Warn("couldn't connect. Trying again in 1s")
+			Slog.Warn("couldn't connect. Trying again in 1s", "err", err)
 			time.Sleep(time.Second)
 			continue
 		}
